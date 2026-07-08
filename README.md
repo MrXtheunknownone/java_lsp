@@ -1,7 +1,7 @@
 # Java LSP
 
 A modern, fast [Language Server Protocol](https://microsoft.github.io/language-server-protocol/)
-implementation for Java, written in Rust, built for Neovim.
+implementation for Java, written in Rust, built for Neovim primarily.
 
 ## Status
 
@@ -35,26 +35,26 @@ answered from whatever's already resolved, never blocked on a slower stage.
 Milestones are ordered bottom-up through the architecture's stages above; each is done
 only when its criterion below is demonstrably true, tested, and verified end-to-end.
 
-- [ ] **M0 — Project Scaffolding & LSP Handshake**
+- [x] **M0 — Project Scaffolding & LSP Handshake**
   Cargo project set up, CI running fmt/clippy/test. Server speaks the LSP transport
   over stdio and completes `initialize`/`initialized`/`shutdown`/`exit` with a real
   client.
   *Done when:* Neovim attaches to the server and receives capabilities without
   crashing.
 
-- [ ] **M1 — Tier 1: Syntax**
+- [x] **M1 — Tier 1: Syntax**
   tree-sitter-java wired in with incremental parsing on `didOpen`/`didChange`/
   `didClose`; syntax errors published as diagnostics.
   *Done when:* a syntax typo in an open Java file shows a live diagnostic in Neovim.
 
-- [ ] **M2 — Tier 2: Local Index**
+- [x] **M2 — Tier 2: Local Index**
   Workspace symbol index built from ASTs (declarations, imports, references within the
   project's own source); completion, go-to-definition, and hover for project-local
   symbols.
   *Done when:* navigating/completing symbols defined in the same workspace works, with
   no external dependency resolved yet.
 
-- [ ] **M3 — Tier 3a: Build Tool Bootstrap**
+- [x] **M3 — Tier 3a: Build Tool Bootstrap**
   Detect Gradle/Maven (multi-module aware), invoke once to resolve source roots,
   classpath, dependency jars, and Java version; cache the resolved project model.
   *Done when:* the resolved classpath for a real Gradle sample project and a real
@@ -89,8 +89,14 @@ Requirements: contributions follow test-driven development — every unit of beh
 is implemented test-first. Code must pass `cargo fmt` and `cargo clippy` cleanly, and
 read clearly enough that it doesn't need comments to explain what it does.
 
-Build and run instructions will be added once the initial scaffolding (see Roadmap,
-M0) lands.
+Build with `cargo build`; run the full test suite with `cargo test`. The server only
+speaks LSP over stdio, so a real client is needed to exercise it manually — a minimal
+Java project lives in [`testbed/`](./testbed) for exactly this: point an editor at it
+with `java-lsp` configured as its Java language server to manually verify a milestone
+end-to-end (see `CLAUDE.md`'s Agentic Development & Review Process). `testbed/` grows
+alongside the roadmap above — it starts as a single classpath-free file and gains a
+build file, a real dependency, and Lombok usage as the milestones that need them
+land.
 
 ## License
 

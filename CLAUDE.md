@@ -143,7 +143,11 @@ No unit is considered done on tests passing alone:
 4. For anything with observable runtime behavior (an LSP capability, a diagnostic, a
    completion result) — run `/verify` or otherwise exercise it end-to-end against a
    real client, not just unit tests. Passing tests confirm the code does what the test
-   says; verification confirms the test said the right thing.
+   says; verification confirms the test said the right thing. Use `testbed/` (a
+   sample Java project in this repo) as the target for this — grow its content
+   exactly when the milestone under test needs the new capability (a build file, a
+   dependency, a Lombok-annotated class, etc.), not ahead of time, per Scope
+   Discipline below.
 
 A milestone is not done until every unit in it clears the above and the milestone's
 "done when" criterion in `README.md` is demonstrably true.
@@ -159,14 +163,21 @@ the change, but staging/committing it is not the agent's job.
 ## Open Decisions
 
 Settled: parsing (tree-sitter), build tool support (Gradle + Maven, `javac` fallback),
-and the multistage async architecture above. Still open — do not silently pick one
-while implementing; raise it for a decision, then update this section:
+the multistage async architecture above, and (as of M0) the following:
 
-- Async runtime: tokio vs. a plain thread-pool/channel-based design. Either is
-  acceptable as long as the never-blocks rule above holds.
-- LSP transport/framework: hand-rolled JSON-RPC vs. an existing crate (e.g. tower-lsp,
-  lsp-server/lsp-types).
-- Crate layout: single crate vs. Cargo workspace split by concern (protocol, parsing,
-  indexing, build-tool integration).
+- Async runtime: **tokio**.
+- LSP transport/framework: **hand-rolled JSON-RPC** framing and dispatch (Content-Length
+  header framing over stdio) — not `tower-lsp`, not `lsp-server`. LSP protocol structs
+  themselves (`InitializeParams`, `ServerCapabilities`, `Diagnostic`, etc.) use the
+  **`lsp-types`** crate rather than being hand-rolled — that schema is large and revs
+  independently of this project, which is exactly the kind of infrastructure the
+  Dependencies section below says to prefer a crate for; the framing/dispatch loop is
+  small and specific enough to us that hand-rolling it is reasonable.
+- Crate layout: **single crate**. No workspace split yet — module boundaries between
+  tiers aren't concrete until later milestones (e.g. M2/M3) give them shape.
+
+Still open — do not silently pick one while implementing; raise it for a decision,
+then update this section:
+
 - Cache persistence: in-memory only (rebuilt each session) vs. on-disk cache to speed
   up reopening large projects.
