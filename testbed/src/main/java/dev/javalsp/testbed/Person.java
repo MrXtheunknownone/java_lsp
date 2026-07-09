@@ -1,3 +1,5 @@
+package dev.javalsp.testbed;
+
 public class Person {
   int age;
   String name;

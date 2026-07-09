@@ -5,7 +5,9 @@ use crate::jsonrpc::{INVALID_PARAMS, Notification, OutgoingNotification, Request
 use crate::project_model::ProjectModel;
 use crate::symbol::extract_symbols;
 use crate::workspace_index::WorkspaceIndex;
-use crate::{completion, goto_definition, gradle, hover, maven, workspace_scan};
+use crate::{
+    completion, external_index, goto_definition, gradle, hover, jdk_home, maven, workspace_scan,
+};
 use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Initialized,
     Notification as _, PublishDiagnostics,
@@ -16,7 +18,7 @@ use lsp_types::{
     DidOpenTextDocumentParams, GotoDefinitionParams, HoverParams, InitializeParams,
     PublishDiagnosticsParams, Uri,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub struct Server {
@@ -230,6 +232,7 @@ impl Server {
         };
 
         let project_model = Arc::clone(&self.project_model);
+        let index = Arc::clone(&self.index);
         self.runtime.spawn_blocking(move || {
             if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let resolved = match tool {
@@ -242,7 +245,8 @@ impl Server {
                             "resolved project model: {} module(s), tool={tool:?}",
                             model.modules.len()
                         );
-                        *lock(&project_model) = Some(model);
+                        *lock(&project_model) = Some(model.clone());
+                        index_external_symbols(&model, &index);
                     }
                     Err(err) => {
                         eprintln!("failed to resolve project model with {tool:?}: {err}");
@@ -252,6 +256,27 @@ impl Server {
                 eprintln!("background build resolution panicked: {panic:?}");
             }
         });
+    }
+}
+
+/// Feeds Tier 2 with symbols from every resolved dependency jar and the JDK
+/// (Tier 3b) — runs after `project_model` is already visible, so a slow
+/// JDK/jar indexing pass never delays the project model itself becoming
+/// available to a request that only needs that.
+fn index_external_symbols(model: &ProjectModel, index: &Arc<Mutex<WorkspaceIndex>>) {
+    let cache_root = external_index::default_cache_root();
+
+    if let Some(jdk) = jdk_home::locate() {
+        external_index::index_jdk(&jdk, &cache_root, index);
+    }
+
+    let mut indexed = HashSet::new();
+    for module in &model.modules {
+        for entry in &module.classpath {
+            if indexed.insert(entry.clone()) {
+                external_index::index_classpath_entry(entry, &cache_root, index);
+            }
+        }
     }
 }
 
@@ -605,6 +630,83 @@ mod tests {
         let guard = server.project_model.lock().unwrap();
         let model = guard.as_ref().unwrap();
         assert_eq!(model.modules.len(), 2);
+    }
+
+    #[test]
+    fn external_symbols_resolve_for_jdk_and_third_party_types_from_a_real_gradle_fixture() {
+        let _guard = crate::test_support::GRADLE_SAMPLE_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let runtime = test_runtime();
+        let mut server = Server::new(runtime.handle().clone());
+
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gradle_sample");
+        let root_uri = format!("file://{}", root.display());
+
+        server.handle_request(&request(
+            1,
+            "initialize",
+            json!({"rootUri": root_uri, "capabilities": {}}),
+        ));
+        server.handle_notification(&notification("initialized", json!({})));
+
+        // Third-party (gson, from the resolved classpath) and JDK (java.base,
+        // via jimage extraction) symbol resolution both run in the background
+        // after the project model resolves — a cold Gradle daemon plus a cold
+        // JDK extraction can genuinely take longer than the 5s default. Wait
+        // for a real `Class`/`Interface` declaration specifically, not just
+        // any symbol named "Gson"/"List" — `Greeter.java`'s own `import
+        // com.google.gson.Gson;` is indexed by the (much faster) workspace
+        // scan and would otherwise satisfy a same-name-only wait condition
+        // well before external resolution actually finishes.
+        let timeout = std::time::Duration::from_secs(90);
+        wait_until_timeout(
+            || {
+                server
+                    .index
+                    .lock()
+                    .unwrap()
+                    .lookup("Gson")
+                    .iter()
+                    .any(|s| s.kind == crate::symbol::SymbolKind::Class)
+            },
+            timeout,
+        );
+        wait_until_timeout(
+            || {
+                server
+                    .index
+                    .lock()
+                    .unwrap()
+                    .lookup("List")
+                    .iter()
+                    .any(|s| s.kind == crate::symbol::SymbolKind::Interface)
+            },
+            timeout,
+        );
+
+        let gson_symbols = server.index.lock().unwrap().lookup("Gson").to_vec();
+        let gson_class = gson_symbols
+            .iter()
+            .find(|s| s.kind == crate::symbol::SymbolKind::Class)
+            .expect("Gson's Class symbol should be indexed");
+        let gson_path = crate::workspace_scan::uri_to_path(&gson_class.uri)
+            .expect("Gson's indexed uri should be a real file:// uri");
+        let gson_source = std::fs::read_to_string(&gson_path)
+            .expect("Gson's stub file should exist on disk and be readable");
+        assert!(gson_source.contains("class Gson"));
+
+        let list_symbols = server.index.lock().unwrap().lookup("List").to_vec();
+        let list_interface = list_symbols
+            .iter()
+            .find(|s| s.kind == crate::symbol::SymbolKind::Interface)
+            .expect("List's Interface symbol should be indexed");
+        let list_path = crate::workspace_scan::uri_to_path(&list_interface.uri)
+            .expect("List's indexed uri should be a real file:// uri");
+        let list_source = std::fs::read_to_string(&list_path)
+            .expect("List's stub file should exist on disk and be readable");
+        assert!(list_source.contains("interface List"));
     }
 
     #[test]

@@ -1,10 +1,15 @@
 pub mod build_tool;
+pub mod class_stub;
+pub mod classfile;
 pub mod completion;
 pub mod documents;
+pub mod external_index;
 pub mod goto_definition;
 pub mod gradle;
 pub mod handshake;
 pub mod hover;
+pub mod jar;
+pub mod jdk_home;
 pub mod jsonrpc;
 pub mod maven;
 pub mod project_model;

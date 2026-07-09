@@ -34,21 +34,30 @@ fn collect_java_files(dir: &Path, files: &mut Vec<PathBuf>) {
 
 pub fn index_workspace(root: &Path, index: &Arc<Mutex<WorkspaceIndex>>) {
     for path in find_java_files(root) {
-        let Some(uri) = path_to_uri(&path) else {
-            continue;
-        };
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-
-        let tree = SyntaxTree::parse(&source);
-        let symbols = extract_symbols(&uri, tree.source(), tree.tree());
-
-        let mut guard = index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.update_file(uri, SCANNED_FROM_DISK, 0, symbols);
+        index_source_file(&path, index);
     }
+}
+
+/// Reads, parses, and indexes a single on-disk `.java` file as though it
+/// were discovered by a workspace scan (`SCANNED_FROM_DISK`, no editor
+/// lifecycle) — shared by `index_workspace` above and by `external_index`'s
+/// synthetic stub files, which are ordinary files on disk once rendered.
+pub(crate) fn index_source_file(path: &Path, index: &Arc<Mutex<WorkspaceIndex>>) -> bool {
+    let Some(uri) = path_to_uri(path) else {
+        return false;
+    };
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return false;
+    };
+
+    let tree = SyntaxTree::parse(&source);
+    let symbols = extract_symbols(&uri, tree.source(), tree.tree());
+
+    let mut guard = index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.update_file(uri, SCANNED_FROM_DISK, 0, symbols);
+    true
 }
 
 fn path_to_uri(path: &Path) -> Option<Uri> {

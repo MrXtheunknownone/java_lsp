@@ -1,6 +1,6 @@
 use crate::symbol::{self, SymbolInfo};
 use lsp_types::Uri;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Generation tag for symbols indexed from disk during the initial workspace
 /// scan, rather than from a client-versioned `didOpen`/`didChange` event. Any
@@ -21,7 +21,7 @@ type Applied = (u64, i32);
 
 #[derive(Default)]
 pub struct WorkspaceIndex {
-    by_name: HashMap<String, Vec<SymbolInfo>>,
+    by_name: BTreeMap<String, Vec<SymbolInfo>>,
     by_uri: HashMap<Uri, Vec<SymbolInfo>>,
     applied: HashMap<Uri, Applied>,
 }
@@ -76,11 +76,18 @@ impl WorkspaceIndex {
     /// One entry per distinct matching name, preferring a real declaration
     /// over an `Import` of the same name (see `symbol::relevance_key`) so a
     /// class and an import of that class don't show up as two suggestions.
+    ///
+    /// `by_name` being a `BTreeMap` means matching names are a contiguous
+    /// range starting at `prefix` — a `range` + `take_while` scan touches
+    /// only the matching entries, rather than every distinct name in the
+    /// index. That matters once external symbol resolution (Tier 3b) can
+    /// add tens of thousands of JDK/library names: a full scan on every
+    /// completion keystroke would violate the never-blocks rule.
     pub fn completions(&self, prefix: &str) -> Vec<&SymbolInfo> {
         let mut matches: Vec<&SymbolInfo> = self
             .by_name
-            .iter()
-            .filter(|(name, _)| name.starts_with(prefix))
+            .range(prefix.to_string()..)
+            .take_while(|(name, _)| name.starts_with(prefix))
             .flat_map(|(_, symbols)| symbols.iter())
             .collect();
 
@@ -262,5 +269,51 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn completions_finds_only_matching_names_among_many_decoy_entries() {
+        let mut index = WorkspaceIndex::new();
+        for i in 0..20_000 {
+            let name = format!("Decoy{i}");
+            let entry_uri = uri(&format!("file:///decoy/{i}.java"));
+            index.update_file(entry_uri.clone(), 1, 1, vec![symbol(&name, entry_uri)]);
+        }
+        let target_uri = uri("file:///Target.java");
+        index.update_file(
+            target_uri.clone(),
+            1,
+            1,
+            vec![symbol("TargetType", target_uri)],
+        );
+
+        let names: Vec<&str> = index
+            .completions("Target")
+            .into_iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["TargetType"]);
+    }
+
+    #[test]
+    fn completions_stays_fast_with_tens_of_thousands_of_distinct_names() {
+        let mut index = WorkspaceIndex::new();
+        for i in 0..50_000 {
+            // Fixed-width so no name is a prefix of another distinct name.
+            let name = format!("java.util.Decoy{i:05}");
+            let entry_uri = uri(&format!("file:///decoy/{i}.java"));
+            index.update_file(entry_uri.clone(), 1, 1, vec![symbol(&name, entry_uri)]);
+        }
+
+        let start = std::time::Instant::now();
+        let matches = index.completions("java.util.Decoy01234");
+        let elapsed = start.elapsed();
+
+        assert_eq!(matches.len(), 1);
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "completions took {elapsed:?}, expected a range query rather than a full scan"
+        );
     }
 }

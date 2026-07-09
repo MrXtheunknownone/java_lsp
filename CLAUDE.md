@@ -22,6 +22,9 @@ cached, never by blocking on the next tier.
 - Tree-sitter incremental parsing, updated on every edit.
 - Produces immediate syntax diagnostics and a syntax tree usable by later tiers.
 - The only tier allowed to run inline on the request path — it's fast enough to.
+- Records, sealed classes/interfaces, and pattern-matching `switch` (including record
+  deconstruction) must parse with the same fidelity as any other Java syntax — the
+  primary DTO/model shapes in modern (Java 17+) Spring/Micronaut code (M14).
 
 ### Tier 2 — Local index (background, async)
 
@@ -31,6 +34,15 @@ cached, never by blocking on the next tier.
   resolution is available.
 - Built and updated incrementally in the background; a file edit re-indexes only the
   affected file(s), never the whole workspace.
+- Framework stereotype/DI annotations (Spring's `@Component`/`@Service`/
+  `@Repository`/`@Controller`/`@RestController`/`@Configuration`/`@Bean`,
+  `@Autowired`/`@Inject`; Micronaut's `@Singleton`/`@Inject`) are modeled as a
+  bean/implementation graph alongside the symbol index, so an injected field or
+  parameter resolves to its concrete implementation(s), not just its declared
+  interface (M9).
+- Records' canonical constructor/accessors and sealed-hierarchy membership are
+  indexed like any other declared member, so completion and exhaustiveness checks see
+  them without special-casing at the call site (M14).
 
 ### Tier 3 — External resolution (background, async, cached)
 
@@ -46,6 +58,19 @@ cached, never by blocking on the next tier.
   so external types resolve the same way local ones do.
 - Annotation processors (notably Lombok) are handled as part of this tier — their
   generated members must become visible to the index, not just silently unresolved.
+- Once dependency/JDK symbols are resolved, the build tool's compile task (or `javac`
+  directly) is also run in the background to surface real type-checking diagnostics —
+  incompatible types, unresolved overloads — not just missing-symbol errors (M8).
+- Matching `-sources.jar`/javadoc jars are resolved and parsed alongside binary jars so
+  hover shows real documentation, not just a bare signature (M13).
+- Configuration metadata embedded in dependency jars (Spring's
+  `spring-configuration-metadata.json`, Micronaut's equivalent) is parsed and
+  cross-referenced against `application.yml`/`.properties` files in the workspace,
+  feeding completion/validation for configuration keys (M10).
+- The same build-tool integration used to resolve the classpath is reused, on demand,
+  to run a single test class/method (Gradle `test --tests`, Maven `-Dtest=`) —
+  user-triggered rather than background-only, but still invoked asynchronously so it
+  never blocks the request thread (M12).
 
 ### Never-blocks rule
 
@@ -70,7 +95,9 @@ tier must be justifiable in a sentence.
 - A slow or unresolved external dependency must never freeze completion, hover, or
   diagnostics for code that doesn't depend on it.
 - Cache aggressively at every tier; invalidate precisely (only the affected
-  files/modules) rather than globally, on change.
+  files/modules) rather than globally, on change. Tier 2/3 caches persist to disk,
+  keyed by source/build-file content hashes, so reopening a project hydrates from the
+  on-disk cache instead of rebuilding from scratch (M11).
 - Surface background work to the client via LSP progress reporting
   (`window/workDoneProgress`) instead of making the client wait silently.
 
@@ -175,9 +202,9 @@ the multistage async architecture above, and (as of M0) the following:
   small and specific enough to us that hand-rolling it is reasonable.
 - Crate layout: **single crate**. No workspace split yet — module boundaries between
   tiers aren't concrete until later milestones (e.g. M2/M3) give them shape.
+- Cache persistence: **on-disk cache**, keyed by source/build-file content hashes —
+  resolved sessions hydrate from disk instead of rebuilding from scratch. See M11 in
+  README.md's roadmap.
 
 Still open — do not silently pick one while implementing; raise it for a decision,
-then update this section:
-
-- Cache persistence: in-memory only (rebuilt each session) vs. on-disk cache to speed
-  up reopening large projects.
+then update this section: (none currently)
