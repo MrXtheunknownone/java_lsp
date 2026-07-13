@@ -1,7 +1,8 @@
-use crate::symbol::extract_symbols;
+use crate::symbol::{SymbolInfo, extract_symbols};
 use crate::syntax::SyntaxTree;
 use crate::workspace_index::{SCANNED_FROM_DISK, WorkspaceIndex};
 use lsp_types::Uri;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -43,6 +44,20 @@ pub fn index_workspace(root: &Path, index: &Arc<Mutex<WorkspaceIndex>>) {
 /// lifecycle) — shared by `index_workspace` above and by `external_index`'s
 /// synthetic stub files, which are ordinary files on disk once rendered.
 pub(crate) fn index_source_file(path: &Path, index: &Arc<Mutex<WorkspaceIndex>>) -> bool {
+    index_source_file_with_overrides(path, index, &HashMap::new())
+}
+
+/// Like [`index_source_file`], but after extracting the file's symbols,
+/// drops any symbol whose name maps to `None` in `overrides` and replaces
+/// any symbol whose name maps to `Some(replacement)` — used by the Lombok
+/// pipeline (see `lombok::stub_symbol_overrides`) to exclude a synthetic
+/// stub's hand-written-duplicate entries and redirect its generated
+/// accessors to their backing fields.
+pub(crate) fn index_source_file_with_overrides(
+    path: &Path,
+    index: &Arc<Mutex<WorkspaceIndex>>,
+    overrides: &HashMap<String, Option<SymbolInfo>>,
+) -> bool {
     let Some(uri) = path_to_uri(path) else {
         return false;
     };
@@ -51,7 +66,13 @@ pub(crate) fn index_source_file(path: &Path, index: &Arc<Mutex<WorkspaceIndex>>)
     };
 
     let tree = SyntaxTree::parse(&source);
-    let symbols = extract_symbols(&uri, tree.source(), tree.tree());
+    let symbols: Vec<SymbolInfo> = extract_symbols(&uri, tree.source(), tree.tree())
+        .into_iter()
+        .filter_map(|symbol| match overrides.get(&symbol.name) {
+            Some(replacement) => replacement.clone(),
+            None => Some(symbol),
+        })
+        .collect();
 
     let mut guard = index
         .lock()
@@ -60,7 +81,7 @@ pub(crate) fn index_source_file(path: &Path, index: &Arc<Mutex<WorkspaceIndex>>)
     true
 }
 
-fn path_to_uri(path: &Path) -> Option<Uri> {
+pub(crate) fn path_to_uri(path: &Path) -> Option<Uri> {
     // Intentionally not canonicalized: canonicalizing (resolving symlinks) here
     // while didOpen/didChange use the client's raw Uri would index the same file
     // under two different Uri keys whenever a symlink is involved.
@@ -263,5 +284,48 @@ mod tests {
         let guard = index.lock().unwrap();
         assert_eq!(guard.lookup("Main").len(), 1);
         assert_eq!(guard.lookup("Greeter").len(), 1);
+    }
+
+    #[test]
+    fn index_source_file_with_overrides_excludes_and_redirects_by_name() {
+        let temp = TempDir::new("workspace-scan-overrides");
+        std::fs::write(
+            temp.path.join("Main.java"),
+            "class Main { void excluded() {} void kept() {} void redirected() {} }",
+        )
+        .unwrap();
+        let field_uri: Uri = "file:///Elsewhere.java".parse().unwrap();
+        let field_range = lsp_types::Range::new(
+            lsp_types::Position::new(3, 0),
+            lsp_types::Position::new(3, 1),
+        );
+        let mut overrides: HashMap<String, Option<SymbolInfo>> = HashMap::new();
+        overrides.insert("excluded".to_string(), None);
+        overrides.insert(
+            "redirected".to_string(),
+            Some(SymbolInfo {
+                name: "redirected".to_string(),
+                kind: crate::symbol::SymbolKind::Method,
+                uri: field_uri.clone(),
+                range: field_range,
+                selection_range: field_range,
+                owner: None,
+            }),
+        );
+
+        let index = Arc::new(Mutex::new(WorkspaceIndex::new()));
+        index_source_file_with_overrides(&temp.path.join("Main.java"), &index, &overrides);
+
+        let guard = index.lock().unwrap();
+        assert!(guard.lookup("excluded").is_empty());
+        assert_eq!(guard.lookup("kept").len(), 1);
+        assert_eq!(
+            guard.lookup("kept")[0].uri,
+            path_to_uri(&temp.path.join("Main.java")).unwrap()
+        );
+        let redirected = guard.lookup("redirected");
+        assert_eq!(redirected.len(), 1);
+        assert_eq!(redirected[0].uri, field_uri);
+        assert_eq!(redirected[0].range, field_range);
     }
 }

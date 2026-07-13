@@ -50,7 +50,16 @@ impl WorkspaceIndex {
         if let Some(old_symbols) = self.by_uri.remove(&uri) {
             for old in old_symbols {
                 if let Some(bucket) = self.by_name.get_mut(&old.name) {
-                    bucket.retain(|s| s.uri != uri);
+                    // Removes exactly the one previously-inserted instance,
+                    // by value — not by comparing `old.uri` against the
+                    // owning `uri` key. A redirected symbol's own `uri` can
+                    // legitimately point elsewhere (e.g. a Lombok-generated
+                    // accessor redirected to its backing field's location),
+                    // so that comparison would silently leave stale
+                    // redirected entries behind on every re-index.
+                    if let Some(pos) = bucket.iter().position(|s| *s == old) {
+                        bucket.remove(pos);
+                    }
                     if bucket.is_empty() {
                         self.by_name.remove(&old.name);
                     }
@@ -84,13 +93,7 @@ impl WorkspaceIndex {
     /// add tens of thousands of JDK/library names: a full scan on every
     /// completion keystroke would violate the never-blocks rule.
     pub fn completions(&self, prefix: &str) -> Vec<&SymbolInfo> {
-        let mut matches: Vec<&SymbolInfo> = self
-            .by_name
-            .range(prefix.to_string()..)
-            .take_while(|(name, _)| name.starts_with(prefix))
-            .flat_map(|(_, symbols)| symbols.iter())
-            .collect();
-
+        let mut matches = self.matching_by_prefix(prefix);
         matches.sort_by(|a, b| {
             a.name
                 .cmp(&b.name)
@@ -98,6 +101,27 @@ impl WorkspaceIndex {
         });
         matches.dedup_by(|a, b| a.name == b.name);
         matches
+    }
+
+    /// Every matching-prefix symbol declared on `owner`, e.g. the members of
+    /// `Person` starting with `"na"` for a `person.na` completion in
+    /// progress. Deliberately doesn't go through [`completions`](Self::completions)'s
+    /// name-only dedup — collapsing to one entry per bare name would let an
+    /// unrelated class's same-named member (e.g. `Car.name`) silently win
+    /// over `Person.name` before owner-filtering ever runs.
+    pub fn completions_by_owner(&self, prefix: &str, owner: &str) -> Vec<&SymbolInfo> {
+        self.matching_by_prefix(prefix)
+            .into_iter()
+            .filter(|symbol| symbol.owner.as_deref() == Some(owner))
+            .collect()
+    }
+
+    fn matching_by_prefix(&self, prefix: &str) -> Vec<&SymbolInfo> {
+        self.by_name
+            .range(prefix.to_string()..)
+            .take_while(|(name, _)| name.starts_with(prefix))
+            .flat_map(|(_, symbols)| symbols.iter())
+            .collect()
     }
 }
 
@@ -119,6 +143,7 @@ mod tests {
             uri,
             range,
             selection_range: range,
+            owner: None,
         }
     }
 
@@ -137,6 +162,37 @@ mod tests {
         index.update_file(doc.clone(), 1, 1, vec![symbol("Main", doc)]);
 
         assert_eq!(index.lookup("Main").len(), 1);
+    }
+
+    #[test]
+    fn update_file_replaces_a_previous_symbol_whose_own_uri_differs_from_the_owning_uri() {
+        // Mirrors a redirected Lombok accessor: indexed under the stub's own
+        // uri, but its `SymbolInfo.uri` points elsewhere (its backing
+        // field's real location) — `old.uri != uri` must not be used to
+        // decide what to clean up on the next `update_file` for that uri.
+        let mut index = WorkspaceIndex::new();
+        let stub_uri = uri("file:///stub/Person.java");
+        let field_uri = uri("file:///real/Person.java");
+        let redirected = symbol("getName", field_uri.clone());
+
+        index.update_file(
+            stub_uri.clone(),
+            SCANNED_FROM_DISK,
+            0,
+            vec![redirected.clone()],
+        );
+        assert_eq!(index.lookup("getName").len(), 1);
+
+        // A second, independent re-index of the exact same stub (e.g. the
+        // workspace-wide sweep and a later per-file save both compiling the
+        // same Lombok-tagged class) must not accumulate a duplicate.
+        index.update_file(stub_uri, SCANNED_FROM_DISK, 0, vec![redirected]);
+
+        assert_eq!(
+            index.lookup("getName").len(),
+            1,
+            "a second re-index of the same stub must replace, not duplicate, a redirected entry"
+        );
     }
 
     #[test]
@@ -262,6 +318,7 @@ mod tests {
                 uri: main_uri,
                 range: Range::new(Position::new(0, 0), Position::new(0, 1)),
                 selection_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+                owner: None,
             }],
         );
 
@@ -269,6 +326,65 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].kind, SymbolKind::Class);
+    }
+
+    fn owned_symbol(name: &str, uri: Uri, owner: &str) -> SymbolInfo {
+        let range = Range::new(Position::new(0, 0), Position::new(0, 1));
+        SymbolInfo {
+            name: name.to_string(),
+            kind: SymbolKind::Field,
+            uri,
+            range,
+            selection_range: range,
+            owner: Some(owner.to_string()),
+        }
+    }
+
+    #[test]
+    fn completions_by_owner_keeps_only_the_matching_owners_symbol() {
+        let mut index = WorkspaceIndex::new();
+        index.update_file(
+            uri("file:///Person.java"),
+            1,
+            1,
+            vec![owned_symbol("name", uri("file:///Person.java"), "Person")],
+        );
+        index.update_file(
+            uri("file:///Car.java"),
+            1,
+            1,
+            vec![owned_symbol("name", uri("file:///Car.java"), "Car")],
+        );
+
+        let matches = index.completions_by_owner("na", "Person");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].uri, uri("file:///Person.java"));
+    }
+
+    #[test]
+    fn completions_by_owner_does_not_dedup_same_named_symbols_from_other_owners_away() {
+        let mut index = WorkspaceIndex::new();
+        // `Car`'s uri sorts before `Person`'s alphabetically — proving this
+        // path skips `completions`'s name-only dedup, which would otherwise
+        // let `Car.name` silently win over `Person.name`.
+        index.update_file(
+            uri("file:///Car.java"),
+            1,
+            1,
+            vec![owned_symbol("name", uri("file:///Car.java"), "Car")],
+        );
+        index.update_file(
+            uri("file:///Person.java"),
+            1,
+            1,
+            vec![owned_symbol("name", uri("file:///Person.java"), "Person")],
+        );
+
+        let matches = index.completions_by_owner("na", "Person");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].uri, uri("file:///Person.java"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 package dev.javalsp.testbed;
 
+import dev.javalsp.testbed.Person;
 import dev.javalsp.testbed.util.Greeter;
 
 public class Main {
@@ -8,5 +9,6 @@ public class Main {
         System.out.println(greeter.greet());
         final Person person = new Person(55, "Hans");
         person.sayHello();
+        System.out.println("Person's name is " + person.getName());
     }
 }

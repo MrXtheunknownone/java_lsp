@@ -1,0 +1,19 @@
+plugins {
+    id 'java'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // A plain `implementation` dependency (not `compileOnly`/`annotationProcessor`)
+    // deliberately: this fixture only needs the real Lombok jar discoverable on the
+    // resolved classpath for javac_compile.rs's own tests, decoupled from the
+    // Gradle-`annotationProcessor`-configuration handling added later.
+    implementation 'org.projectlombok:lombok:1.18.46'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+}

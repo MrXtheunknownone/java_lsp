@@ -16,4 +16,6 @@ milestone that needs it lands, not ahead of time:
   detection and classpath resolution.
 - **M4**: a real third-party dependency, to exercise external jar/JDK symbol
   resolution.
-- **M5**: a Lombok-annotated class, to exercise annotation processor support.
+- **M5** (done): `Person` is `@Getter @Setter` (`lombok`, added to `build.gradle`);
+  `Main.java` calls `person.getName()` so the generated getter has a real,
+  navigable call site.

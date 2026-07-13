@@ -1,6 +1,7 @@
 use crate::project_model::{ModuleModel, ProjectModel};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const INIT_SCRIPT: &str = r#"
 allprojects {
@@ -19,6 +20,12 @@ allprojects {
                     sourceSets.main.runtimeClasspath.files.each { f ->
                         println "JAVA_LSP_CLASSPATH_ENTRY ${f}"
                     }
+                    // Lombok's recommended Gradle setup (`compileOnly` +
+                    // `annotationProcessor`) keeps its jar off the runtime
+                    // classpath above, so surface it separately.
+                    project.configurations.findByName('annotationProcessor')?.files?.each { f ->
+                        println "JAVA_LSP_CLASSPATH_ENTRY ${f}"
+                    }
                 }
             }
         }
@@ -26,9 +33,17 @@ allprojects {
 }
 "#;
 
+/// Distinguishes concurrent invocations from the same process — every
+/// gradle-invoking test shares one `process::id()`, so that alone isn't a
+/// unique temp-file name; two concurrent invocations racing on the same
+/// init-script path could see one's cleanup delete the file the other is
+/// still reading.
+static INIT_SCRIPT_COUNTER: AtomicU32 = AtomicU32::new(0);
+
 pub fn resolve_project_model(root: &Path) -> Result<ProjectModel, String> {
+    let invocation_id = INIT_SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let init_script_path = std::env::temp_dir().join(format!(
-        "java-lsp-gradle-init-{}.gradle",
+        "java-lsp-gradle-init-{}-{invocation_id}.gradle",
         std::process::id()
     ));
     std::fs::write(&init_script_path, INIT_SCRIPT)
@@ -185,6 +200,16 @@ JAVA_LSP_CLASSPATH_ENTRY /root/gson.jar
                 .iter()
                 .any(|entry| entry.file_name().is_some_and(|n| n == "gson-2.10.1.jar")),
             "app's classpath should transitively include gson: {:?}",
+            app.classpath
+        );
+        assert!(
+            app.classpath.iter().any(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.to_lowercase().contains("lombok"))
+            }),
+            "app's classpath should include lombok via the annotationProcessor configuration: {:?}",
             app.classpath
         );
         assert!(

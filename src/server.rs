@@ -6,20 +6,23 @@ use crate::project_model::ProjectModel;
 use crate::symbol::extract_symbols;
 use crate::workspace_index::WorkspaceIndex;
 use crate::{
-    completion, external_index, goto_definition, gradle, hover, jdk_home, maven, workspace_scan,
+    classfile, completion, external_index, goto_definition, gradle, hover, javac_compile,
+    javac_fallback, jdk_home, lombok, maven, syntax, workspace_scan,
 };
 use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Initialized,
-    Notification as _, PublishDiagnostics,
+    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+    Initialized, Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{Completion, GotoDefinition, HoverRequest, Initialize, Request as _};
 use lsp_types::{
     CompletionParams, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, GotoDefinitionParams, HoverParams, InitializeParams,
-    PublishDiagnosticsParams, Uri,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams, HoverParams,
+    InitializeParams, PublishDiagnosticsParams, Uri,
 };
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tree_sitter::Tree;
 
 pub struct Server {
     handshake: Handshake,
@@ -32,6 +35,10 @@ pub struct Server {
     /// version. See `workspace_index::WorkspaceIndex`'s `Applied` type for why.
     next_generation: u64,
     document_generations: HashMap<Uri, u64>,
+    /// The content hash last used to trigger a Lombok recompile for a given
+    /// document — skips a redundant recompile on a save/open with
+    /// byte-identical content.
+    lombok_source_hashes: HashMap<Uri, u64>,
 }
 
 impl Server {
@@ -45,6 +52,7 @@ impl Server {
             workspace_root: None,
             next_generation: 0,
             document_generations: HashMap::new(),
+            lombok_source_hashes: HashMap::new(),
         }
     }
 
@@ -79,6 +87,9 @@ impl Server {
                 }
                 DidCloseTextDocument::METHOD => {
                     return (ExitAction::Continue, self.handle_did_close(notification));
+                }
+                DidSaveTextDocument::METHOD => {
+                    return (ExitAction::Continue, self.handle_did_save(notification));
                 }
                 Initialized::METHOD => {
                     self.trigger_workspace_scan();
@@ -147,6 +158,7 @@ impl Server {
         self.document_generations.insert(uri.clone(), generation);
         let diagnostics = self.documents.open(uri.clone(), &params.text_document.text);
         self.spawn_reindex(&uri, generation, version);
+        self.trigger_lombok_compile(&uri);
         vec![publish_diagnostics_notification(uri, diagnostics)]
     }
 
@@ -176,6 +188,60 @@ impl Server {
         let uri = params.text_document.uri;
         self.documents.close(&uri);
         vec![publish_diagnostics_notification(uri, Vec::new())]
+    }
+
+    /// The `DocumentStore` is already kept current via `didChange`, so this
+    /// doesn't need the save params' (optional) text — it's the trigger
+    /// point for the Lombok recompile check, deliberately not `didChange`,
+    /// so a real `javac` process isn't spawned on every keystroke.
+    fn handle_did_save(&mut self, notification: &Notification) -> Vec<OutgoingNotification> {
+        let Some(params) = parse_params::<DidSaveTextDocumentParams>(notification, "didSave")
+        else {
+            return Vec::new();
+        };
+        self.trigger_lombok_compile(&params.text_document.uri);
+        Vec::new()
+    }
+
+    /// Checks whether `uri`'s currently tracked document uses Lombok and,
+    /// if so and its content actually changed since the last trigger,
+    /// spawns a background `javac`+Lombok compile (see `compile_lombok_file`).
+    /// Silently does nothing for a non-Lombok file, an unopened document, or
+    /// a project model that hasn't resolved yet — all expected, not errors.
+    fn trigger_lombok_compile(&mut self, uri: &Uri) {
+        let Some(document) = self.documents.document(uri) else {
+            return;
+        };
+        if !lombok::uses_lombok(document.tree(), document.source()) {
+            return;
+        }
+
+        let hash = lombok::content_hash(document.source());
+        if self.lombok_source_hashes.get(uri) == Some(&hash) {
+            return;
+        }
+        self.lombok_source_hashes.insert(uri.clone(), hash);
+
+        let Some(file_path) = workspace_scan::uri_to_path(uri) else {
+            return;
+        };
+        let tree = document.tree().clone();
+        let source = document.source().to_string();
+        let project_model = Arc::clone(&self.project_model);
+        let index = Arc::clone(&self.index);
+
+        self.runtime.spawn_blocking(move || {
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let guard = lock(&project_model);
+                let Some(model) = guard.as_ref() else {
+                    return;
+                };
+                let cache_root = external_index::default_cache_root();
+                compile_lombok_file(&file_path, &source, &tree, model, &cache_root, &index);
+            })) {
+                eprintln!("background lombok compile panicked: {panic:?}");
+            }
+        });
     }
 
     fn spawn_reindex(&self, uri: &Uri, generation: u64, version: i32) {
@@ -227,17 +293,19 @@ impl Server {
             return;
         };
 
-        let Some(tool) = build_tool::detect(&root_path) else {
-            return;
-        };
+        let tool = build_tool::detect(&root_path);
 
         let project_model = Arc::clone(&self.project_model);
         let index = Arc::clone(&self.index);
         self.runtime.spawn_blocking(move || {
             if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let resolved = match tool {
-                    BuildTool::Gradle => gradle::resolve_project_model(&root_path),
-                    BuildTool::Maven => maven::resolve_project_model(&root_path),
+                    Some(BuildTool::Gradle) => gradle::resolve_project_model(&root_path),
+                    Some(BuildTool::Maven) => maven::resolve_project_model(&root_path),
+                    // No build tool: still resolve a minimal, JDK-only model so
+                    // JDK types (e.g. `java.util.List`) resolve for classpath-free
+                    // projects too — see `javac_fallback`.
+                    None => Ok(javac_fallback::resolve_project_model(&root_path)),
                 };
                 match resolved {
                     Ok(model) => {
@@ -247,6 +315,7 @@ impl Server {
                         );
                         *lock(&project_model) = Some(model.clone());
                         index_external_symbols(&model, &index);
+                        compile_lombok_files(&root_path, &model, &index);
                     }
                     Err(err) => {
                         eprintln!("failed to resolve project model with {tool:?}: {err}");
@@ -278,6 +347,100 @@ fn index_external_symbols(model: &ProjectModel, index: &Arc<Mutex<WorkspaceIndex
             }
         }
     }
+}
+
+/// Sweeps the whole workspace once, right after `project_model` resolves,
+/// for Lombok-tagged files that are never individually opened but are
+/// still referenced elsewhere — runs synchronously since it's already
+/// inside a background task, and requires no wait/retry machinery since
+/// `project_model` already exists by this point.
+fn compile_lombok_files(
+    root_path: &Path,
+    model: &ProjectModel,
+    index: &Arc<Mutex<WorkspaceIndex>>,
+) {
+    let cache_root = external_index::default_cache_root();
+    for file in workspace_scan::find_java_files(root_path) {
+        let Ok(source) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let tree = syntax::SyntaxTree::parse(&source);
+        compile_lombok_file(&file, &source, tree.tree(), model, &cache_root, index);
+    }
+}
+
+/// Compiles `file` with Lombok on the processor path if it uses Lombok and
+/// its owning module has a resolvable Lombok jar. Silently does nothing
+/// otherwise — a non-Lombok file, no owning module, no Lombok dependency,
+/// or no locatable JDK are all expected outcomes, not errors.
+fn compile_lombok_file(
+    file: &Path,
+    source: &str,
+    tree: &Tree,
+    model: &ProjectModel,
+    cache_root: &Path,
+    index: &Arc<Mutex<WorkspaceIndex>>,
+) {
+    if !lombok::uses_lombok(tree, source) {
+        return;
+    }
+    let Some(module) = model.module_for_file(file) else {
+        return;
+    };
+    let Some(lombok_jar) = javac_compile::find_lombok_jar(&module.classpath) else {
+        return;
+    };
+    let Some(jdk) = jdk_home::locate() else {
+        return;
+    };
+
+    let output_dir = javac_compile::output_dir_for_module(cache_root, &module.root);
+    match javac_compile::compile(file, module, lombok_jar, &output_dir, &jdk) {
+        Ok(()) => {
+            external_index::index_javac_output(&output_dir, cache_root, index);
+            redirect_lombok_accessors(file, source, tree, &output_dir, cache_root, index);
+        }
+        Err(err) => eprintln!("lombok compile failed for {file:?}: {err}"),
+    }
+}
+
+/// After the generic `index_javac_output` above has indexed every compiled
+/// class in `output_dir`, corrects the *one* class that was just compiled
+/// from `file`: excludes any hand-written member (already correctly
+/// indexed from the real source by Tier 2) and redirects any Lombok-generated
+/// accessor to its backing field (see `lombok::stub_symbol_overrides`).
+/// Silently does nothing if the expected compiled classfile can't be found —
+/// an unexpected but non-fatal outcome; the generic indexing above still
+/// stands.
+fn redirect_lombok_accessors(
+    file: &Path,
+    source: &str,
+    tree: &Tree,
+    output_dir: &Path,
+    cache_root: &Path,
+    index: &Arc<Mutex<WorkspaceIndex>>,
+) {
+    let Some(file_uri) = workspace_scan::path_to_uri(file) else {
+        return;
+    };
+    let Some(stem) = file.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+
+    let class_relative: PathBuf = match lombok::source_package(tree, source) {
+        Some(package) => Path::new(&package.replace('.', "/")).join(format!("{stem}.class")),
+        None => PathBuf::from(format!("{stem}.class")),
+    };
+    let Ok(bytes) = std::fs::read(output_dir.join(class_relative)) else {
+        return;
+    };
+    let Ok(class) = classfile::parse(&bytes) else {
+        return;
+    };
+
+    let original_symbols = extract_symbols(&file_uri, source, tree);
+    let overrides = lombok::stub_symbol_overrides(&class, &original_symbols);
+    external_index::reindex_class_file_with_overrides(&class, cache_root, index, &overrides);
 }
 
 /// Locks `mutex`, recovering from poisoning rather than propagating it — a
@@ -504,6 +667,32 @@ mod tests {
     }
 
     #[test]
+    fn did_save_while_initialized_is_accepted_without_error() {
+        let runtime = test_runtime();
+        let mut server = Server::new(runtime.handle().clone());
+        initialize(&mut server);
+        server.handle_notification(&notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": "file:///Main.java",
+                    "languageId": "java",
+                    "version": 1,
+                    "text": "class Main {}"
+                }
+            }),
+        ));
+
+        let (exit, outgoing) = server.handle_notification(&notification(
+            "textDocument/didSave",
+            json!({"textDocument": {"uri": "file:///Main.java"}}),
+        ));
+
+        assert_eq!(exit, ExitAction::Continue);
+        assert!(outgoing.is_empty());
+    }
+
+    #[test]
     fn reopening_a_closed_document_with_a_lower_version_number_still_reindexes() {
         let runtime = test_runtime();
         let mut server = Server::new(runtime.handle().clone());
@@ -603,6 +792,65 @@ mod tests {
     }
 
     #[test]
+    fn goto_definition_on_a_qualified_call_resolves_only_the_receivers_own_class() {
+        let runtime = test_runtime();
+        let mut server = Server::new(runtime.handle().clone());
+        initialize(&mut server);
+
+        server.handle_notification(&notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": "file:///Person.java",
+                    "languageId": "java",
+                    "version": 1,
+                    "text": "class Person { String getName() { return null; } }"
+                }
+            }),
+        ));
+        server.handle_notification(&notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": "file:///Car.java",
+                    "languageId": "java",
+                    "version": 1,
+                    "text": "class Car { String getName() { return null; } }"
+                }
+            }),
+        ));
+        server.handle_notification(&notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": "file:///Main.java",
+                    "languageId": "java",
+                    "version": 1,
+                    "text": "class Main { void run() { Person person = new Person(); person.getName(); } }"
+                }
+            }),
+        ));
+
+        wait_until(|| server.index.lock().unwrap().lookup("getName").len() >= 2);
+
+        let position_of_get_name =
+            "class Main { void run() { Person person = new Person(); person.get".len();
+        let response = server.handle_request(&request(
+            2,
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": "file:///Main.java"},
+                "position": {"line": 0, "character": position_of_get_name}
+            }),
+        ));
+        let value = serde_json::to_value(&response).unwrap();
+
+        assert!(value["result"].is_array());
+        assert_eq!(value["result"].as_array().unwrap().len(), 1);
+        assert_eq!(value["result"][0]["uri"], json!("file:///Person.java"));
+    }
+
+    #[test]
     fn initialized_triggers_build_resolution_for_a_real_gradle_fixture() {
         let _guard = crate::test_support::GRADLE_SAMPLE_LOCK
             .lock()
@@ -630,6 +878,41 @@ mod tests {
         let guard = server.project_model.lock().unwrap();
         let model = guard.as_ref().unwrap();
         assert_eq!(model.modules.len(), 2);
+    }
+
+    #[test]
+    fn a_build_tool_less_workspace_still_resolves_jdk_types() {
+        let runtime = test_runtime();
+        let mut server = Server::new(runtime.handle().clone());
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/no_build_tool_sample");
+        let root_uri = format!("file://{}", root.display());
+
+        server.handle_request(&request(
+            1,
+            "initialize",
+            json!({"rootUri": root_uri, "capabilities": {}}),
+        ));
+        server.handle_notification(&notification("initialized", json!({})));
+
+        wait_until_timeout(
+            || {
+                server
+                    .index
+                    .lock()
+                    .unwrap()
+                    .lookup("List")
+                    .iter()
+                    .any(|s| s.kind == crate::symbol::SymbolKind::Interface)
+            },
+            std::time::Duration::from_secs(60),
+        );
+
+        let guard = server.project_model.lock().unwrap();
+        let model = guard.as_ref().unwrap();
+        assert_eq!(model.modules.len(), 1);
+        assert!(model.modules[0].classpath.is_empty());
     }
 
     #[test]
@@ -707,6 +990,149 @@ mod tests {
         let list_source = std::fs::read_to_string(&list_path)
             .expect("List's stub file should exist on disk and be readable");
         assert!(list_source.contains("interface List"));
+    }
+
+    #[test]
+    fn lombok_generated_getters_resolve_from_the_workspace_wide_sweep() {
+        let _guard = crate::test_support::GRADLE_SAMPLE_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let runtime = test_runtime();
+        let mut server = Server::new(runtime.handle().clone());
+
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gradle_sample");
+        let root_uri = format!("file://{}", root.display());
+
+        server.handle_request(&request(
+            1,
+            "initialize",
+            json!({"rootUri": root_uri, "capabilities": {}}),
+        ));
+        server.handle_notification(&notification("initialized", json!({})));
+
+        // `Widget.java` (checked into the fixture) is `@Getter @Setter` over a
+        // `name` field, never individually opened — this exercises the
+        // workspace-wide sweep in `compile_lombok_files`, not the per-edit path.
+        let widget_path = root.join("app/src/main/java/com/example/app/Widget.java");
+        wait_until_timeout(
+            || {
+                server
+                    .index
+                    .lock()
+                    .unwrap()
+                    .lookup("getName")
+                    .iter()
+                    .any(|s| {
+                        crate::workspace_scan::uri_to_path(&s.uri).as_deref()
+                            == Some(widget_path.as_path())
+                    })
+            },
+            std::time::Duration::from_secs(90),
+        );
+
+        // The generated getter redirects to the real backing field, not the
+        // synthetic stub.
+        let symbols = server.index.lock().unwrap().lookup("getName").to_vec();
+        let method = symbols
+            .iter()
+            .find(|s| {
+                crate::workspace_scan::uri_to_path(&s.uri).as_deref() == Some(widget_path.as_path())
+            })
+            .expect("getName should redirect to Widget.java");
+        assert_eq!(method.kind, crate::symbol::SymbolKind::Method);
+        let source = std::fs::read_to_string(&widget_path).unwrap();
+        assert_eq!(
+            &source[crate::text_position::position_to_byte_offset(
+                &source,
+                method.selection_range.start
+            )
+                ..crate::text_position::position_to_byte_offset(
+                    &source,
+                    method.selection_range.end
+                )],
+            "name"
+        );
+
+        // A hand-written method in the same Lombok-touched file must not get
+        // a second, duplicate entry from the synthetic stub.
+        wait_until_timeout(
+            || !server.index.lock().unwrap().lookup("describe").is_empty(),
+            std::time::Duration::from_secs(30),
+        );
+        let describe_symbols = server.index.lock().unwrap().lookup("describe").to_vec();
+        assert_eq!(
+            describe_symbols.len(),
+            1,
+            "describe() must resolve to exactly the real source, not also a stub duplicate: {describe_symbols:?}"
+        );
+        assert_eq!(
+            crate::workspace_scan::uri_to_path(&describe_symbols[0].uri).as_deref(),
+            Some(widget_path.as_path())
+        );
+    }
+
+    /// Deletes a fixture file added at test time regardless of how the test
+    /// exits, so a panic mid-test doesn't leave litter in a checked-in
+    /// fixture directory.
+    struct CleanupFile(std::path::PathBuf);
+    impl Drop for CleanupFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn did_save_on_a_newly_added_lombok_file_makes_its_getter_resolvable() {
+        let _guard = crate::test_support::GRADLE_SAMPLE_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gradle_sample");
+        let new_file = root.join("app/src/main/java/com/example/app/Gadget.java");
+        let source = "package com.example.app;\n\nimport lombok.Getter;\n\n@Getter\npublic class Gadget {\n    private String title;\n}\n";
+        std::fs::write(&new_file, source).unwrap();
+        let _cleanup = CleanupFile(new_file.clone());
+        let file_uri = format!("file://{}", new_file.display());
+
+        let runtime = test_runtime();
+        let mut server = Server::new(runtime.handle().clone());
+        let root_uri = format!("file://{}", root.display());
+        server.handle_request(&request(
+            1,
+            "initialize",
+            json!({"rootUri": root_uri, "capabilities": {}}),
+        ));
+        server.handle_notification(&notification("initialized", json!({})));
+
+        server.handle_notification(&notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": source
+                }
+            }),
+        ));
+        server.handle_notification(&notification(
+            "textDocument/didSave",
+            json!({"textDocument": {"uri": file_uri}}),
+        ));
+
+        wait_until_timeout(
+            || {
+                server
+                    .index
+                    .lock()
+                    .unwrap()
+                    .lookup("getTitle")
+                    .iter()
+                    .any(|s| s.kind == crate::symbol::SymbolKind::Method)
+            },
+            std::time::Duration::from_secs(90),
+        );
     }
 
     #[test]

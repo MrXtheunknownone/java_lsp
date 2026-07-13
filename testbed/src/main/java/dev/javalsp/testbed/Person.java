@@ -1,5 +1,10 @@
 package dev.javalsp.testbed;
 
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
 public class Person {
   int age;
   String name;

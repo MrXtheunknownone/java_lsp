@@ -5,6 +5,7 @@ use lsp_types::request::{Initialize, Request as _, Shutdown};
 use lsp_types::{
     CompletionOptions, HoverProviderCapability, InitializeResult, OneOf, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions,
 };
 use serde_json::Value;
 
@@ -46,12 +47,15 @@ impl Handshake {
                                 change: Some(TextDocumentSyncKind::INCREMENTAL),
                                 will_save: None,
                                 will_save_wait_until: None,
-                                save: None,
+                                save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                             },
                         )),
                         definition_provider: Some(OneOf::Left(true)),
                         hover_provider: Some(HoverProviderCapability::Simple(true)),
-                        completion_provider: Some(CompletionOptions::default()),
+                        completion_provider: Some(CompletionOptions {
+                            trigger_characters: Some(vec![".".to_string()]),
+                            ..CompletionOptions::default()
+                        }),
                         ..ServerCapabilities::default()
                     },
                     server_info: None,
@@ -151,6 +155,17 @@ mod tests {
     }
 
     #[test]
+    fn initialize_advertises_save_support() {
+        let mut handshake = Handshake::new();
+
+        let response = handshake.handle_request(&request(1, "initialize"));
+        let value = serde_json::to_value(&response).unwrap();
+
+        let sync = &value["result"]["capabilities"]["textDocumentSync"];
+        assert_eq!(sync["save"], json!(true));
+    }
+
+    #[test]
     fn initialize_advertises_definition_hover_and_completion_support() {
         let mut handshake = Handshake::new();
 
@@ -161,6 +176,18 @@ mod tests {
         assert_eq!(capabilities["definitionProvider"], json!(true));
         assert_eq!(capabilities["hoverProvider"], json!(true));
         assert!(capabilities["completionProvider"].is_object());
+    }
+
+    #[test]
+    fn initialize_registers_dot_as_a_completion_trigger_character() {
+        let mut handshake = Handshake::new();
+
+        let response = handshake.handle_request(&request(1, "initialize"));
+        let value = serde_json::to_value(&response).unwrap();
+
+        let trigger_characters =
+            &value["result"]["capabilities"]["completionProvider"]["triggerCharacters"];
+        assert_eq!(trigger_characters, &json!(["."]));
     }
 
     #[test]

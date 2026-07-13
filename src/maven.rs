@@ -58,7 +58,7 @@ fn collect_modules(dir: &Path, discovered: &mut Vec<PathBuf>) {
     }
 }
 
-fn standard_source_dirs(module_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn standard_source_dirs(module_dir: &Path) -> Vec<PathBuf> {
     ["src/main/java", "src/test/java"]
         .into_iter()
         .map(|relative| module_dir.join(relative))
@@ -257,6 +257,20 @@ mod tests {
                 .iter()
                 .any(|entry| entry.file_name().is_some_and(|n| n == "lib-1.0.0.jar")),
             "app's classpath should include lib's built jar: {:?}",
+            app.classpath
+        );
+        // Verifies, rather than assumes, that Maven's default `dependency:
+        // build-classpath` scope inclusion already surfaces a `provided`-scope
+        // dependency (Lombok's conventional Maven setup) with no `maven.rs`
+        // change needed.
+        assert!(
+            app.classpath.iter().any(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.to_lowercase().contains("lombok"))
+            }),
+            "app's classpath should include the provided-scope lombok dependency: {:?}",
             app.classpath
         );
         assert!(

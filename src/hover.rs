@@ -1,4 +1,5 @@
 use crate::documents::DocumentStore;
+use crate::member_reference::member_reference_at;
 use crate::symbol::{self, SymbolKind};
 use crate::workspace_index::WorkspaceIndex;
 use lsp_types::{Hover, HoverContents, HoverParams, MarkedString};
@@ -11,7 +12,13 @@ pub fn hover(
     let position_params = &params.text_document_position_params;
     let document = documents.document(&position_params.text_document.uri)?;
     let (name, range) = document.identifier_at(position_params.position)?;
-    let symbol = symbol::best_match(index.lookup(&name))?;
+
+    let candidates = index.lookup(&name);
+    let receiver_type =
+        member_reference_at(document.tree(), document.source(), position_params.position)
+            .map(|reference| reference.receiver_type);
+    let narrowed = symbol::narrow_to_receiver_type(candidates, receiver_type.as_deref());
+    let symbol = symbol::best_match(narrowed)?;
 
     Some(Hover {
         contents: HoverContents::Scalar(MarkedString::String(format!(
@@ -75,6 +82,7 @@ mod tests {
                 uri: greeter,
                 range,
                 selection_range: range,
+                owner: None,
             }],
         );
 
@@ -100,6 +108,7 @@ mod tests {
             uri: greeter,
             range: class_range,
             selection_range: class_range,
+            owner: None,
         };
         let import_range = Range::new(Position::new(0, 0), Position::new(0, 7));
         let import_symbol = SymbolInfo {
@@ -108,6 +117,7 @@ mod tests {
             uri: main.clone(),
             range: import_range,
             selection_range: import_range,
+            owner: None,
         };
 
         let mut documents = DocumentStore::new();
@@ -158,5 +168,63 @@ mod tests {
         let result = hover(&index, &documents, &params(main, position));
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn hover_on_a_qualified_method_call_describes_only_the_receivers_own_declaring_class() {
+        let main = uri("file:///Main.java");
+        let person_uri = uri("file:///Person.java");
+        let car_uri = uri("file:///Car.java");
+        let range = Range::new(Position::new(0, 0), Position::new(0, 7));
+
+        let mut documents = DocumentStore::new();
+        documents.open(
+            main.clone(),
+            "class Main { void run() { Person person = new Person(); person.getName(); } }",
+        );
+
+        // `Car`'s decoy is a `Field`, and its uri sorts before `Person`'s
+        // alphabetically — so without receiver-type narrowing, `best_match`'s
+        // uri-ordered tie-break would pick this wrong, unrelated symbol.
+        let mut index = WorkspaceIndex::new();
+        index.update_file(
+            person_uri.clone(),
+            1,
+            1,
+            vec![SymbolInfo {
+                name: "getName".to_string(),
+                kind: SymbolKind::Method,
+                uri: person_uri.clone(),
+                range,
+                selection_range: range,
+                owner: Some("Person".to_string()),
+            }],
+        );
+        index.update_file(
+            car_uri.clone(),
+            1,
+            1,
+            vec![SymbolInfo {
+                name: "getName".to_string(),
+                kind: SymbolKind::Field,
+                uri: car_uri,
+                range,
+                selection_range: range,
+                owner: Some("Car".to_string()),
+            }],
+        );
+
+        let position = Position::new(
+            0,
+            "class Main { void run() { Person person = new Person(); person.get".len() as u32,
+        );
+        let result = hover(&index, &documents, &params(main, position)).unwrap();
+
+        match result.contents {
+            HoverContents::Scalar(MarkedString::String(text)) => {
+                assert_eq!(text, "method getName");
+            }
+            other => panic!("expected a scalar string, got {other:?}"),
+        }
     }
 }

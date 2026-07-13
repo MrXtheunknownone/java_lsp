@@ -141,6 +141,37 @@ impl SyntaxTree {
         }
         self.source[start..byte_offset].to_string()
     }
+
+    /// The identifier immediately before a `.` that itself immediately
+    /// precedes the partial member name at `position` (as found by
+    /// [`identifier_prefix_before`](Self::identifier_prefix_before)) — the
+    /// receiver of a `receiver.partial` member completion in progress.
+    /// Returns the receiver's name together with a position within its own
+    /// span (for resolving its declared type). `None` when the cursor isn't
+    /// right after a `.`-qualified prefix (a bare/global completion).
+    pub fn qualified_completion_receiver(&self, position: Position) -> Option<(String, Position)> {
+        let byte_offset = position_to_byte_offset(&self.source, position);
+        let prefix_len = self.identifier_prefix_before(position).len();
+        let dot_index = byte_offset.checked_sub(prefix_len)?.checked_sub(1)?;
+        if self.source.as_bytes().get(dot_index) != Some(&b'.') {
+            return None;
+        }
+
+        let mut start = dot_index;
+        for (idx, ch) in self.source[..dot_index].char_indices().rev() {
+            if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+                start = idx;
+            } else {
+                break;
+            }
+        }
+        if start == dot_index {
+            return None;
+        }
+
+        let receiver_position = byte_offset_to_position(&self.source, start);
+        Some((self.source[start..dot_index].to_string(), receiver_position))
+    }
 }
 
 fn collect_error_diagnostics(node: Node, source: &str, diagnostics: &mut Vec<Diagnostic>) {
@@ -333,5 +364,43 @@ mod tests {
         let prefix = tree.identifier_prefix_before(Position::new(0, 6));
 
         assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn qualified_completion_receiver_finds_the_identifier_before_a_dot() {
+        let source = "class Main { void run() { person.na } }";
+        let tree = SyntaxTree::parse(source);
+        let position = "class Main { void run() { person.na".len() as u32;
+
+        let (receiver, receiver_position) = tree
+            .qualified_completion_receiver(Position::new(0, position))
+            .unwrap();
+
+        assert_eq!(receiver, "person");
+        assert_eq!(
+            receiver_position,
+            Position::new(0, "class Main { void run() { ".len() as u32)
+        );
+    }
+
+    #[test]
+    fn qualified_completion_receiver_returns_none_without_a_preceding_dot() {
+        let tree = SyntaxTree::parse("class Main { void run() { int gree } }");
+        let position = "class Main { void run() { int gree".len() as u32;
+
+        assert_eq!(
+            tree.qualified_completion_receiver(Position::new(0, position)),
+            None
+        );
+    }
+
+    #[test]
+    fn qualified_completion_receiver_returns_none_when_nothing_precedes_the_dot() {
+        let tree = SyntaxTree::parse(".na");
+
+        assert_eq!(
+            tree.qualified_completion_receiver(Position::new(0, 3)),
+            None
+        );
     }
 }

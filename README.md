@@ -65,7 +65,7 @@ only when its criterion below is demonstrably true, tested, and verified end-to-
   *Done when:* completion/hover/go-to-definition work for JDK types (e.g.
   `java.util.List`) and third-party library types.
 
-- [ ] **M5 — javac Fallback & Annotation Processing**
+- [x] **M5 — javac Fallback & Annotation Processing**
   `javac`-backed fallback for build-tool-less, classpath-free code; annotation
   processor (notably Lombok) generated members made visible to the index.
   *Done when:* a Lombok-annotated class resolves its generated getters/setters
@@ -79,7 +79,14 @@ only when its criterion below is demonstrably true, tested, and verified end-to-
 
 - [ ] **M7 — LSP Feature Completeness & Distribution**
   Remaining capabilities as needed (find references, rename, code actions,
-  formatting, semantic tokens); documented Neovim setup.
+  formatting, semantic tokens); documented Neovim setup. Also covers two
+  receiver-type-resolution follow-ups deferred from the M2 goto-definition/
+  hover/completion fix (name-only lookup flooding same-named results across
+  unrelated classes): walking a receiver's `extends` chain so an *inherited*
+  member (e.g. `dog.getName()` declared on `Dog`'s superclass) still narrows
+  to one result instead of falling back to every same-named candidate; and,
+  relatedly, resolving a chained call's own return type (`getPerson().getName()`)
+  instead of giving up on receiver-type resolution entirely.
   *Done when:* a documented Neovim config installs and uses the server for day-to-day
   Java editing.
 
